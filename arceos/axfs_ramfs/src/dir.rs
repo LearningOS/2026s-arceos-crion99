@@ -67,6 +67,22 @@ impl DirNode {
         children.remove(name);
         Ok(())
     }
+    pub fn rename_node(&self, old_name: &str, new_name: &str) -> VfsResult {
+        if old_name == new_name {
+            return Ok(());
+        }
+
+        let mut children = self.children.write();
+
+        if children.contains_key(new_name) {
+            return Err(VfsError::AlreadyExists);
+        }
+
+        let node = children.remove(old_name).ok_or(VfsError::NotFound)?;
+        children.insert(new_name.into(), node);
+
+        Ok(())
+    }
 }
 
 impl VfsNodeOps for DirNode {
@@ -165,6 +181,31 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        log::warn!("RAMFS rename called: {} -> {}", src_path, dst_path);
+
+        let (src_name, src_rest) = split_path(src_path);
+        let (dst_name, dst_rest) = split_path(dst_path);
+
+        if let (Some(src_rest), Some(dst_rest)) = (src_rest, dst_rest) {
+            if src_name == dst_name {
+                let child = self
+                    .children
+                    .read()
+                    .get(src_name)
+                    .ok_or(VfsError::NotFound)?
+                    .clone();
+
+                return child.rename(src_rest, dst_rest);
+            }
+        }
+
+        let old_name = file_name(src_path)?;
+        let new_name = file_name(dst_path)?;
+
+        self.rename_node(old_name, new_name)
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
 }
 
@@ -173,4 +214,13 @@ fn split_path(path: &str) -> (&str, Option<&str>) {
     trimmed_path.find('/').map_or((trimmed_path, None), |n| {
         (&trimmed_path[..n], Some(&trimmed_path[n + 1..]))
     })
+}
+fn file_name(path: &str) -> VfsResult<&str> {
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+
+    if name.is_empty() || name == "." || name == ".." {
+        Err(VfsError::InvalidInput)
+    } else {
+        Ok(name)
+    }
 }
