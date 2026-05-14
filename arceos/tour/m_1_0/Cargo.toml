@@ -12,3 +12,5 @@ axtask = { workspace = true }
 axlog = { workspace = true }
 axerrno = "0.1"
 linkme = "0.3"
+memory_addr = "0.3.2"
+page_table_entry = "0.4.3"
