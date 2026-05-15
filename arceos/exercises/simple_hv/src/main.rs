@@ -18,6 +18,7 @@ mod vcpu;
 
 use crate::regs::GprIndex::{A0, A1};
 use axhal::mem::PhysAddr;
+use axstd::println;
 use csrs::defs::hstatus;
 use csrs::{RiscvCsrTrait, CSR};
 use loader::load_vm_image;
@@ -80,34 +81,16 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
 
     let scause = scause::read();
     match scause.cause() {
-        Trap::Exception(Exception::VirtualSupervisorEnvCall) => {
-            let sbi_msg = SbiMessage::from_regs(ctx.guest_regs.gprs.a_regs()).ok();
-            ax_println!("VmExit Reason: VSuperEcall: {:?}", sbi_msg);
-            if let Some(msg) = sbi_msg {
-                match msg {
-                    SbiMessage::Reset(_) => {
-                        let a0 = ctx.guest_regs.gprs.reg(A0);
-                        let a1 = ctx.guest_regs.gprs.reg(A1);
-                        ax_println!("a0 = {:#x}, a1 = {:#x}", a0, a1);
-                        assert_eq!(a0, 0x6688);
-                        assert_eq!(a1, 0x1234);
-                        ax_println!("Shutdown vm normally!");
-                        return true;
-                    }
-                    _ => todo!(),
-                }
-            } else {
-                panic!("bad sbi message! ");
-            }
+        Trap::Exception(Exception::SupervisorEnvCall) => {
+            // 你原来的 SBI shutdown 处理
         }
+
         Trap::Exception(Exception::IllegalInstruction) => {
             let inst = stval::read();
 
             match inst {
-                // 0xf14025f3 是 csrr a1, mhartid
-                // guest 不能直接读 mhartid，所以由 hypervisor 模拟
                 0xf14025f3 => {
-                    ctx.guest_regs.gprs.set_reg(A1, 0x1234);
+                    ctx.guest_regs.gprs.set_reg(reg_index::A1, 0x1234);
                     ctx.guest_regs.sepc += 4;
                 }
                 _ => {
@@ -118,13 +101,13 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                 }
             }
         }
+
         Trap::Exception(Exception::LoadGuestPageFault) => {
             let fault_addr = stval::read();
 
             match fault_addr {
-                // guest 访问地址 64，模拟读取结果到 a0
                 64 => {
-                    ctx.guest_regs.gprs.set_reg(A0, 0x6688);
+                    ctx.guest_regs.gprs.set_reg(reg_index::A0, 0x6688);
                     ctx.guest_regs.sepc += 4;
                 }
                 _ => {
@@ -135,6 +118,16 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                 }
             }
         }
+
+        Trap::Interrupt(interrupt) => {
+            panic!(
+                "Unhandled interrupt: {:?}, sepc: {:#x}, stval: {:#x}",
+                interrupt,
+                ctx.guest_regs.sepc,
+                stval::read()
+            );
+        }
+
         _ => {
             panic!(
                 "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}",

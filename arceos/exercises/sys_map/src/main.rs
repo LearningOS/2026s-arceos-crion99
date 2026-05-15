@@ -1,26 +1,27 @@
 #![cfg_attr(feature = "axstd", no_std)]
 #![cfg_attr(feature = "axstd", no_main)]
 
+extern crate alloc;
 #[cfg(feature = "axstd")]
 extern crate axstd as std;
-extern crate alloc;
 
 #[macro_use]
 extern crate axlog;
 
-mod task;
-mod syscall;
 mod loader;
+mod syscall;
+mod task;
+pub static USER_ASPACE: Mutex<Option<Arc<Mutex<AddrSpace>>>> = Mutex::new(None);
 
-use axstd::io;
-use axhal::paging::MappingFlags;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::sync::Arc;
 use axhal::arch::UspaceContext;
 use axhal::mem::VirtAddr;
-use axsync::Mutex;
-use alloc::sync::Arc;
-use alloc::string::String;
-use alloc::collections::BTreeMap;
+use axhal::paging::MappingFlags;
 use axmm::AddrSpace;
+use axstd::io;
+use axsync::Mutex;
 use loader::load_user_app;
 
 const USER_STACK_SIZE: usize = 0x10000;
@@ -43,10 +44,12 @@ fn main() {
     ax_println!("New user address space: {:#x?}", uspace);
 
     // Let's kick off the user process.
-    let user_task = task::spawn_user_task(
-        Arc::new(Mutex::new(uspace)),
-        UspaceContext::new(entry, ustack_top),
-    );
+    // Let's kick off the user process.
+    let shared_uspace = Arc::new(Mutex::new(uspace));
+
+    *USER_ASPACE.lock() = Some(Arc::clone(&shared_uspace));
+
+    let user_task = task::spawn_user_task(shared_uspace, UspaceContext::new(entry, ustack_top));
 
     // Wait for user process to exit ...
     let exit_code = user_task.join();
@@ -58,14 +61,17 @@ fn init_user_stack(uspace: &mut AddrSpace, populating: bool) -> io::Result<VirtA
     let ustack_vaddr = ustack_top - crate::USER_STACK_SIZE;
     ax_println!(
         "Mapping user stack: {:#x?} -> {:#x?}",
-        ustack_vaddr, ustack_top
-    );
-    uspace.map_alloc(
         ustack_vaddr,
-        crate::USER_STACK_SIZE,
-        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-        populating,
-    ).unwrap();
+        ustack_top
+    );
+    uspace
+        .map_alloc(
+            ustack_vaddr,
+            crate::USER_STACK_SIZE,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+            populating,
+        )
+        .unwrap();
 
     let app_name = "hello";
     let av = BTreeMap::new();
