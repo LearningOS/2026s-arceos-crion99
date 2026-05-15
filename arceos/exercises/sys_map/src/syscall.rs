@@ -19,6 +19,8 @@ const SYS_EXIT: usize = 93;
 const SYS_EXIT_GROUP: usize = 94;
 const SYS_SET_TID_ADDRESS: usize = 96;
 const SYS_MMAP: usize = 222;
+const PAGE_SIZE: usize = 0x1000;
+const MMAP_BASE: usize = 0x1000_0000;
 
 const AT_FDCWD: i32 = -100;
 
@@ -133,15 +135,157 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
 
 #[allow(unused_variables)]
 fn sys_mmap(
-    addr: *mut usize,
+    addr: *mut c_void,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    // 1. 基本参数检查
+    if length == 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+
+    if offset < 0 || (offset as usize) & (PAGE_SIZE - 1) != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+
+    let map_size = match align_up_4k(length) {
+        Some(size) => size,
+        None => return neg_errno(LinuxError::ENOMEM),
+    };
+
+    let prot_flags = match MmapProt::from_bits(prot) {
+        Some(p) => p,
+        None => return neg_errno(LinuxError::EINVAL),
+    };
+
+    let mmap_flags = MmapFlags::from_bits_truncate(flags);
+
+    // mmap 最终应该给用户的权限
+    let final_flags: MappingFlags = prot_flags.into();
+
+    // 内核要先把文件内容写进去，所以临时加 WRITE。
+    // 写完后再 protect 回用户要求的权限。
+    let temp_flags =
+        final_flags | MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER;
+
+    // 2. 如果不是匿名映射，就从 fd 读文件内容
+    let mut data = vec![0u8; length];
+
+    if !mmap_flags.contains(MmapFlags::MAP_ANONYMOUS) {
+        if fd < 0 {
+            return neg_errno(LinuxError::EBADF);
+        }
+
+        let read_result = with_file_fd(fd, |file| {
+            // 这个测例 offset 是 0。
+            // 这里为了稍微完整一点，offset 非 0 时先读掉 offset 字节。
+            let mut skip = offset as usize;
+            let mut scratch = [0u8; 512];
+
+            while skip > 0 {
+                let n = core::cmp::min(skip, scratch.len());
+                let read_n = file
+                    .read(&mut scratch[..n])
+                    .map_err(LinuxError::from)?;
+
+                if read_n == 0 {
+                    break;
+                }
+
+                skip -= read_n;
+            }
+
+            let mut done = 0usize;
+            while done < data.len() {
+                let n = file
+                    .read(&mut data[done..])
+                    .map_err(LinuxError::from)?;
+
+                if n == 0 {
+                    break;
+                }
+
+                done += n;
+            }
+
+            Ok(())
+        });
+
+        if let Err(e) = read_result {
+            return neg_errno(e);
+        }
+    }
+
+    // 3. 取当前用户地址空间
+    let shared_aspace = match crate::USER_ASPACE.lock().as_ref().cloned() {
+        Some(aspace) => aspace,
+        None => return neg_errno(LinuxError::EINVAL),
+    };
+
+    let mut aspace = shared_aspace.lock();
+
+    // 4. 选择 mmap 返回的用户虚拟地址
+    let start_vaddr = if mmap_flags.contains(MmapFlags::MAP_FIXED) {
+        let fixed = VirtAddr::from(addr as usize);
+
+        if addr.is_null() || !fixed.is_aligned_4k() {
+            return neg_errno(LinuxError::EINVAL);
+        }
+
+        if !aspace.contains_range(fixed, map_size) {
+            return neg_errno(LinuxError::ENOMEM);
+        }
+
+        fixed
+    } else {
+        let limit_start = VirtAddr::from(MMAP_BASE);
+        let limit_end = aspace.end();
+
+        let mut hint = if addr.is_null() {
+            limit_start
+        } else {
+            VirtAddr::from(addr as usize).align_up_4k()
+        };
+
+        if hint < limit_start {
+            hint = limit_start;
+        }
+
+        match aspace.find_free_area(hint, map_size, va_range!(limit_start..limit_end)) {
+            Some(vaddr) => vaddr,
+            None => return neg_errno(LinuxError::ENOMEM),
+        }
+    };
+
+    // 5. 建立用户虚拟地址到物理页的映射
+    if aspace
+        .map_alloc(start_vaddr, map_size, temp_flags, true)
+        .is_err()
+    {
+        return neg_errno(LinuxError::ENOMEM);
+    }
+
+    // 6. 把文件内容写入刚刚映射好的用户虚拟地址
+    if !data.is_empty() {
+        if aspace.write(start_vaddr, &data).is_err() {
+            let _ = aspace.unmap(start_vaddr, map_size);
+            return neg_errno(LinuxError::EFAULT);
+        }
+    }
+
+    // 7. 恢复成用户 mmap 请求的权限，比如 PROT_READ 就只读
+    if aspace.protect(start_vaddr, map_size, final_flags).is_err() {
+        let _ = aspace.unmap(start_vaddr, map_size);
+        return neg_errno(LinuxError::EINVAL);
+    }
+
+    // 8. mmap 成功返回映射起始地址
+    start_vaddr.as_usize() as isize
 }
+
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
     assert_eq!(dfd, AT_FDCWD);
