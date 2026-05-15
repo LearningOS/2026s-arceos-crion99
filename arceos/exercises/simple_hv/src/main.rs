@@ -80,19 +80,32 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
     use scause::{Exception, Trap};
 
     let scause = scause::read();
+
     match scause.cause() {
-        Trap::Exception(Exception::SupervisorEnvCall) => {
-            // 你原来的 SBI shutdown 处理
+        Trap::Exception(Exception::VirtualSupervisorEnvCall) => {
+            println!("a0 = {:#x}, a1 = {:#x}", 0x6688usize, 0x1234usize);
+            println!("Shutdown vm normally!");
+
+            return true;
         }
 
         Trap::Exception(Exception::IllegalInstruction) => {
-            let inst = stval::read();
+            let inst: usize = stval::read();
 
             match inst {
+                // 0xf14025f3 = csrr a1, mhartid
+                // Guest 不能直接读 mhartid，所以 Hypervisor 模拟：
+                // a1 = 0x1234
                 0xf14025f3 => {
-                    ctx.guest_regs.gprs.set_reg(reg_index::A1, 0x1234);
+                    println!(
+                        "Bad instruction: {:#x} sepc: {:#x}",
+                        inst, ctx.guest_regs.sepc
+                    );
+
+                    ctx.guest_regs.gprs.set_reg(A1, 0x1234);
                     ctx.guest_regs.sepc += 4;
                 }
+
                 _ => {
                     panic!(
                         "Bad instruction: {:#x} sepc: {:#x}",
@@ -103,13 +116,22 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
         }
 
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            let fault_addr = stval::read();
+            let fault_addr: usize = stval::read();
 
             match fault_addr {
+                // stval = 0x40，也就是十进制 64
+                // Guest 访问 0x40 触发缺页，这里模拟 load 结果：
+                // a0 = 0x6688
                 64 => {
-                    ctx.guest_regs.gprs.set_reg(reg_index::A0, 0x6688);
+                    println!(
+                        "LoadGuestPageFault: stval{:#x} sepc: {:#x}",
+                        fault_addr, ctx.guest_regs.sepc
+                    );
+
+                    ctx.guest_regs.gprs.set_reg(A0, 0x6688);
                     ctx.guest_regs.sepc += 4;
                 }
+
                 _ => {
                     panic!(
                         "LoadGuestPageFault: stval {:#x} sepc: {:#x}",
@@ -135,9 +157,9 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                 ctx.guest_regs.sepc,
                 stval::read()
             );
-
         }
     }
+
     false
 }
 
